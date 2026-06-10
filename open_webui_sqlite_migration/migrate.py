@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 SQLite to PostgreSQL migration for Open WebUI
+Forked from open-webui-sqlite-migration 0.1.22 (Digitalist Open Cloud)
+Updated for Open WebUI 0.9.6 compatibility
 """
 
 import os
@@ -23,14 +25,14 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
 from rich.panel import Panel
 from rich.table import Table
 
-__version__ = "0.1.22"
+__version__ = "0.1.22+owui0.9.6"
 console = Console()
 
 
 def parse_args():
     """Parse arguments."""
     parser = argparse.ArgumentParser(
-        description="SQLite to PostgreSQL migration for Open WebUI",
+        description="SQLite to PostgreSQL migration for Open WebUI (0.9.6+)",
         add_help=True,
     )
     parser.add_argument(
@@ -131,6 +133,9 @@ def pg_ident(name: str) -> str:
         return f'"{name}"'
     return name
 
+# Tables listed in FK-safe migration order.
+# New in 0.9.6: shared_chat, pinned_note, calendar, calendar_event,
+#               calendar_event_attendee, automation, automation_run
 TABLE_ORDER = [
     "user",
     "knowledge",
@@ -164,6 +169,14 @@ TABLE_ORDER = [
     "chat_file",
     "channel_file",
     "knowledge_file",
+    # 0.9.6 additions
+    "shared_chat",
+    "pinned_note",
+    "calendar",
+    "calendar_event",
+    "calendar_event_attendee",
+    "automation",
+    "automation_run",
 ]
 
 TABLE_DEPENDENCIES = {
@@ -177,6 +190,12 @@ TABLE_DEPENDENCIES = {
     "channel_member": ["channel"],
     "chat_message": ["chat"],
     "message_reaction": ["message"],
+    # 0.9.6 additions
+    "shared_chat": ["chat"],
+    "pinned_note": ["note"],
+    "calendar_event": ["calendar"],
+    "calendar_event_attendee": ["calendar_event"],
+    "automation_run": ["automation"],
 }
 
 def sqlite_tables(conn: sqlite3.Connection) -> List[str]:
@@ -224,14 +243,65 @@ def pg_column_types(conn, table: str) -> Dict[str, str]:
         """, (table,))
         return dict(cur.fetchall())
 
+def pg_table_exists(conn, table: str) -> bool:
+    """Check whether a table exists in the public schema."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+        """, (table,))
+        return cur.fetchone() is not None
+
 def stream_sqlite_rows(
     conn: sqlite3.Connection,
     table: str,
     columns: List[str],
+    dedup_col: str = None,
 ) -> Iterable[tuple]:
-    col_sql = ", ".join(f'"{c}"' for c in columns)
-    cur = conn.execute(f'SELECT {col_sql} FROM "{table}"')
+    """
+    Yield rows from SQLite for the given columns.
 
+    If dedup_col is set, rows are deduplicated in-memory by that column
+    (last write wins) and rows where dedup_col IS NULL are dropped.
+    This is needed for tables like `document` whose PG primary key differs
+    from the legacy SQLite schema — avoiding PK-constraint failures on COPY.
+    """
+    col_sql = ", ".join(f'"{c}"' for c in columns)
+
+    if dedup_col and dedup_col in columns:
+        pk_idx = columns.index(dedup_col)
+        # Load all rows and deduplicate; acceptable because document tables
+        # are typically small (hundreds to low thousands of rows).
+        cur = conn.execute(f'SELECT {col_sql} FROM "{table}"')
+        seen: Dict[str, tuple] = {}
+        null_count = 0
+        for row in cur.fetchall():
+            pk_val = row[pk_idx]
+            if pk_val is None:
+                null_count += 1
+                continue
+            seen[pk_val] = row
+        if null_count:
+            console.print(
+                f"[yellow]WARNING:[/] {table}: {null_count} row(s) with NULL "
+                f'"{dedup_col}" dropped (cannot insert into PG primary key)'
+            )
+        dup_count = 0
+        cur2 = conn.execute(f'SELECT COUNT(*) FROM "{table}"')
+        total = cur2.fetchone()[0]
+        dup_count = total - null_count - len(seen)
+        if dup_count > 0:
+            console.print(
+                f"[yellow]WARNING:[/] {table}: {dup_count} duplicate "
+                f'"{dedup_col}" row(s) deduplicated (kept last)'
+            )
+        for row in seen.values():
+            yield row
+        return
+
+    cur = conn.execute(f'SELECT {col_sql} FROM "{table}"')
     while True:
         rows = cur.fetchmany(500)
         if not rows:
@@ -242,6 +312,14 @@ def stream_sqlite_rows(
 NOT_NULL_COLUMNS = {
     "prompt": {"content"},
     "group": {"description"},
+}
+
+# Tables where SQLite may contain legacy columns that are NOT the PK in PG.
+# Maps table_name → the real PG primary key column(s) used for deduplication.
+# If SQLite has duplicate values for the PG PK (e.g. from schema migrations),
+# we keep only the last row per key to avoid PK-constraint failures on COPY.
+DEDUP_BY_PK = {
+    "document": "collection_name",
 }
 
 
@@ -303,19 +381,35 @@ class CopyStream:
         if self._exhausted and not self._buffer:
             return ""
 
-        # Fill buffer until we have enough data or exhausted
         while len(self._buffer) < size and not self._exhausted:
             self._buffer += self._next_line()
 
-        # Return up to `size` bytes
         result = self._buffer[:size]
         self._buffer = self._buffer[size:]
 
         return result
 
+def pg_columns_for_table(conn, table: str) -> List[str]:
+    """Return the column names that actually exist in the PG table."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            ORDER BY ordinal_position
+        """, (table,))
+        return [r[0] for r in cur.fetchall()]
+
 def migrate_table(sqlite_conn: sqlite3.Connection, pg_conn, table: str):
     """Migrate a table."""
     start_time = time.time()
+
+    # Skip tables that don't exist in PG (e.g. old SQLite-only tables)
+    if not pg_table_exists(pg_conn, table):
+        console.print(f"[yellow]SKIP:[/] {table} (not in PostgreSQL schema)")
+        return
+
     sqlite_count = sqlite_conn.execute(
         f'SELECT COUNT(*) FROM "{table}"'
     ).fetchone()[0]
@@ -330,15 +424,32 @@ def migrate_table(sqlite_conn: sqlite3.Connection, pg_conn, table: str):
         return
 
     schema = sqlite_schema(sqlite_conn, table)
-    columns = [c[1] for c in schema]
+    sqlite_columns = [c[1] for c in schema]
     pg_types = pg_column_types(pg_conn, table)
+
+    # Only copy columns that exist in both SQLite and PG to handle schema drift
+    pg_cols_set = set(pg_column_types(pg_conn, table).keys())
+    columns = [c for c in sqlite_columns if c in pg_cols_set]
+
+    if not columns:
+        console.print(f"[yellow]SKIP:[/] {table} (no matching columns)")
+        return
+
+    missing_in_pg = [c for c in sqlite_columns if c not in pg_cols_set]
+    if missing_in_pg:
+        console.print(
+            f"[yellow]WARNING:[/] {table}: SQLite columns not in PG (skipped): "
+            f"{', '.join(missing_in_pg)}"
+        )
+
     with pg_conn.cursor() as cur:
         cur.execute(f"TRUNCATE TABLE {pg_ident(table)} CASCADE")
     pg_conn.commit()
 
+    dedup_col = DEDUP_BY_PK.get(table)
     row_iter = (
         normalize_row(row, columns, pg_types, table)
-        for row in stream_sqlite_rows(sqlite_conn, table, columns)
+        for row in stream_sqlite_rows(sqlite_conn, table, columns, dedup_col=dedup_col)
     )
 
     with pg_conn.cursor() as cur:
@@ -347,8 +458,24 @@ def migrate_table(sqlite_conn: sqlite3.Connection, pg_conn, table: str):
             f"FROM STDIN WITH CSV NULL '{COPY_NULL_MARKER}'",
             CopyStream(row_iter),
         )
+    pg_conn.commit()
+
+    # Verify row count after COPY so we catch silent data loss immediately
+    with pg_conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {pg_ident(table)}")
+        pg_count_after = cur.fetchone()[0]
+
     elapsed = time.time() - start_time
-    console.print(f"[green]Migrated {table} in {elapsed:.2f}s[/]")
+    if pg_count_after < sqlite_count:
+        console.print(
+            f"[yellow]WARNING:[/] {table}: SQLite had {sqlite_count} rows, "
+            f"PG has {pg_count_after} after migration "
+            f"({sqlite_count - pg_count_after} rows not transferred)"
+        )
+    else:
+        console.print(
+            f"[green]Migrated {table}: {pg_count_after} rows in {elapsed:.2f}s[/]"
+        )
 
 def main():
     """ Run the script """
@@ -439,11 +566,11 @@ def main():
             sqlite_count = sqlite_counts.get(t, 0)
             pg_count = pg_counts.get(t, 0)
             if sqlite_count == pg_count:
-                status = "[green]✓[/]"
+                status = "[green]OK[/]"
             elif sqlite_count == -1 or pg_count == -1:
                 status = "[yellow]N/A[/]"
             else:
-                status = "[red]✗[/]"
+                status = "[red]MISMATCH[/]"
                 mismatches.append(t)
             result_table.add_row(t, f"{sqlite_count:,}", f"{pg_count:,}", status)
 
@@ -457,7 +584,7 @@ def main():
 
     console.print(
         Panel(
-            f"SQLite to PostgreSQL Migration "
+            f"SQLite to PostgreSQL Migration for Open WebUI 0.9.6+ "
             f"{'(DRY-RUN)' if DRY_RUN else ''}",
             style="cyan",
         )
