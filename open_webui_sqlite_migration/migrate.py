@@ -134,6 +134,11 @@ def pg_ident(name: str) -> str:
     return name
 
 # Tables listed in FK-safe migration order.
+# IMPORTANT: every table whose TRUNCATE CASCADE could empty a later table
+# must appear BEFORE that later table. Concretely:
+#   knowledge_directory.id ← knowledge_file.directory_id (ON DELETE SET NULL)
+#   → TRUNCATE knowledge_directory CASCADE wipes knowledge_file rows!
+#   → knowledge_directory must be processed BEFORE knowledge_file.
 # New in 0.9.6: shared_chat, pinned_note, calendar, calendar_event,
 #               calendar_event_attendee, automation, automation_run
 TABLE_ORDER = [
@@ -168,6 +173,7 @@ TABLE_ORDER = [
     "access_grant",
     "chat_file",
     "channel_file",
+    "knowledge_directory",  # must be before knowledge_file: TRUNCATE CASCADE would wipe it otherwise
     "knowledge_file",
     # 0.9.6 additions
     "shared_chat",
@@ -182,7 +188,7 @@ TABLE_ORDER = [
 TABLE_DEPENDENCIES = {
     "chat_file": ["chat", "file"],
     "channel_file": ["channel", "file"],
-    "knowledge_file": ["knowledge", "file"],
+    "knowledge_file": ["knowledge", "file", "knowledge_directory"],
     "api_key": ["user"],
     "oauth_session": ["user"],
     "group_member": ["group", "user"],
